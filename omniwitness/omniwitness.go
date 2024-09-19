@@ -34,7 +34,8 @@ import (
 	"github.com/transparency-dev/witness/internal/witness"
 	"golang.org/x/mod/sumdb/note"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/time/rate"
+
+	// "golang.org/x/time/rate"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
@@ -43,7 +44,8 @@ import (
 	f_note "github.com/transparency-dev/formats/note"
 	"github.com/transparency-dev/witness/internal/distribute/rest"
 	"github.com/transparency-dev/witness/internal/feeder"
-	"github.com/transparency-dev/witness/internal/feeder/bastion"
+
+	// "github.com/transparency-dev/witness/internal/feeder/bastion"
 	"github.com/transparency-dev/witness/internal/feeder/pixelbt"
 	"github.com/transparency-dev/witness/internal/feeder/rekor"
 	"github.com/transparency-dev/witness/internal/feeder/serverless"
@@ -150,44 +152,83 @@ func Main(ctx context.Context, operatorConfig OperatorConfig, p LogStatePersiste
 	bw := witnessAdapter{
 		w: witness,
 	}
-	for c, f := range feeders {
-		c, f := c, f
-		// Continually feed this log in its own goroutine, hooked up to the global waitgroup.
-		g.Go(func() error {
-			klog.Infof("Feeder %q goroutine started", c.Origin)
-			defer klog.Infof("Feeder %q goroutine done", c.Origin)
-			return f(ctx, c, bw, httpClient, operatorConfig.FeedInterval)
-		})
-	}
-
-	if operatorConfig.BastionAddr != "" && operatorConfig.BastionKey != nil {
-		bc := bastion.Config{
-			Addr:            operatorConfig.BastionAddr,
-			Logs:            logs,
-			BastionKey:      operatorConfig.BastionKey,
-			WitnessVerifier: signerCosigV1.Verifier(),
-			Limits: bastion.RequestLimits{
-				TotalPerSecond: rate.Limit(operatorConfig.BastionRateLimit),
-			}}
-		g.Go(func() error {
-			klog.Infof("Bastion feeder %q goroutine started", bc.Addr)
-			defer klog.Infof("Bastion feeder %q goroutine done", bc.Addr)
-			return bastion.FeedBastion(ctx, bc, bw)
-		})
-	}
-
-	if operatorConfig.RestDistributorBaseURL != "" {
-		klog.Infof("Starting RESTful distributor for %q", operatorConfig.RestDistributorBaseURL)
-		logs := make([]config.Log, 0, len(feeders))
-		for l := range feeders {
-			logs = append(logs, l)
-		}
-		runRestDistributors(ctx, g, httpClient, operatorConfig.DistributeInterval, logs, operatorConfig.RestDistributorBaseURL, bw, signerCosigV1.Verifier())
-	}
+	// for c, f := range feeders {
+	// 	c, f := c, f
+	// 	// Continually feed this log in its own goroutine, hooked up to the global waitgroup.
+	// 	g.Go(func() error {
+	// 		klog.Infof("Feeder %q goroutine started", c.Origin)
+	// 		defer klog.Infof("Feeder %q goroutine done", c.Origin)
+	// 		return f(ctx, c, bw, httpClient, operatorConfig.FeedInterval)
+	// 	})
+	// }
+	//
+	// if operatorConfig.BastionAddr != "" && operatorConfig.BastionKey != nil {
+	// 	bc := bastion.Config{
+	// 		Addr:            operatorConfig.BastionAddr,
+	// 		Logs:            logs,
+	// 		BastionKey:      operatorConfig.BastionKey,
+	// 		WitnessVerifier: signerCosigV1.Verifier(),
+	// 		Limits: bastion.RequestLimits{
+	// 			TotalPerSecond: rate.Limit(operatorConfig.BastionRateLimit),
+	// 		}}
+	// 	g.Go(func() error {
+	// 		klog.Infof("Bastion feeder %q goroutine started", bc.Addr)
+	// 		defer klog.Infof("Bastion feeder %q goroutine done", bc.Addr)
+	// 		return bastion.FeedBastion(ctx, bc, bw)
+	// 	})
+	// }
+	//
+	// if operatorConfig.RestDistributorBaseURL != "" {
+	// 	klog.Infof("Starting RESTful distributor for %q", operatorConfig.RestDistributorBaseURL)
+	// 	logs := make([]config.Log, 0, len(feeders))
+	// 	for l := range feeders {
+	// 		logs = append(logs, l)
+	// 	}
+	// 	runRestDistributors(ctx, g, httpClient, operatorConfig.DistributeInterval, logs, operatorConfig.RestDistributorBaseURL, bw, signerCosigV1.Verifier())
+	// }
 
 	r := mux.NewRouter()
 	s := ihttp.NewServer(witness)
 	s.RegisterHandlers(r)
+
+	// ----------------------------------------
+	r.HandleFunc("/witness/v0/logs/refresh", func(w http.ResponseWriter, r *http.Request) {
+		// run all the feeders once in parallel
+		var g errgroup.Group
+		for c, f := range feeders {
+			c, f := c, f
+			g.Go(func() error {
+				klog.Infof("Running feeder for %q", c.Origin)
+				// time.Duration(0) means run once
+				err := f(ctx, c, bw, httpClient, time.Duration(0))
+				if err != nil {
+					klog.Errorf("Feeder error %q: %v", c.Origin, err)
+				}
+				// ensures that all goroutines are run even if one fails
+				return nil
+			})
+		}
+		g.Wait()
+
+		// if a distributor is configured, distribute updates to it
+		if operatorConfig.RestDistributorBaseURL != "" {
+			klog.Infof("Distributing updates to %q", operatorConfig.RestDistributorBaseURL)
+			logs := make([]config.Log, 0, len(feeders))
+			for l := range feeders {
+				logs = append(logs, l)
+			}
+
+			d, err := rest.NewDistributor(operatorConfig.RestDistributorBaseURL, httpClient, logs, signerCosigV1.Verifier(), bw)
+			if err != nil {
+				klog.Errorf("NewDistributor: %v", err)
+			}
+			if err := d.DistributeOnce(ctx); err != nil {
+				klog.Errorf("DistributeOnce: %v", err)
+			}
+		}
+	}).Methods(http.MethodPost)
+	// ----------------------------------------
+
 	srv := http.Server{
 		Handler:      r,
 		ReadTimeout:  30 * time.Second,
